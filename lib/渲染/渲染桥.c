@@ -2046,6 +2046,91 @@ uintptr_t XT_SynthSoundMulti(uintptr_t freq_hz, uintptr_t ms, uintptr_t osc_coun
     xt_snd_used[slot] = 1;
     return XT_FROM_INT(slot + 1);
 }
+
+// ═══════════════════════════════════════════════════════════════
+// FM(相位调制)合成 —— 补 合成器 的一个能力缺口
+//
+// 合成器 是"加法叠加":最多四路振荡器一起响,谁都不调制谁。所以它做不出
+// 非谐波的音色(金属、玻璃、水滴那种"说不清是什么东西"的质感)——那类音色的
+// 来源是"一路波形去调制另一路的相位",调制频率与载波不成整数比时,频谱就
+// 散成一堆非谐分音。
+//
+// 两 OP 就够用:载波 sin(2πf t + 指数·sin(2πf·比 t))。
+// 比 = 调制频率 ÷ 载波:整数(1/2/3)是谐音,像乐器;1.41 / 2.76 / 3.71 这类
+// 非整数是非谐,金属或玻璃;指数 = 调制深度,0 退化为纯正弦,2~4 亮,6 以上糊。
+//
+// 与 合成器 的关系:输出同一种东西——定长 PCM 一次算完装进谐振(单声道 16 位,
+// 22050Hz,和本库其余合成入口一致),返回同一个音效槽位池的句柄,播放/释放走
+// 既有的 播音效/释音效。不做实时调参(库内没有任何入口做实时调参,都是烘焙)。
+//
+// 与"离线用脚本生成 wav"的关系:参数与 内容包的 音效表 一一对应,作者可以两边
+// 挑——要最稳就存 wav,要改参数就改数字重开。逐样本循环放在 C 侧,是因为玄铁侧
+// 逐样本浮点运算有内存增长(见 RPG 仓库 docs 里那条记录),长音走玄铁不划算。
+// ═══════════════════════════════════════════════════════════════
+uintptr_t XT_SynthFM(uintptr_t carrier_hz, uintptr_t ratio, uintptr_t index,
+                     uintptr_t ms, uintptr_t decay_ms, uintptr_t vol, uintptr_t fade_ms) {
+    int slot = xt_snd_alloc();
+    if (slot < 0) return XT_FROM_INT(0);
+    const int rate = 22050;
+    double f = xt_get_float(carrier_hz);
+    if (f <= 0.0) f = 440.0;
+    if (f > (double)rate / 2.0) f = (double)rate / 2.0;   // 载波高过奈奎斯特会变成镜像噪声
+    double r = xt_get_float(ratio);
+    if (r <= 0.0) r = 1.0;
+    if (r > 16.0) r = 16.0;
+    double idx = xt_get_float(index);
+    if (idx < 0.0) idx = 0.0;
+    if (idx > 12.0) idx = 12.0;                           // 再深就是噪声,没有音色意义
+    int m = (int)xt_ni(ms);
+    if (m <= 0) m = 90;
+    if (m > 10000) m = 10000;
+    double dec = xt_get_float(decay_ms);
+    if (dec < 0.0) dec = 0.0;
+    double v = xt_get_float(vol);
+    if (v < 0.0) v = 0.0;
+    if (v > 1.0) v = 1.0;
+    int fd = (int)xt_ni(fade_ms);
+    if (fd < 0) fd = 0;
+
+    int n = (int)((long long)rate * m / 1000);
+    if (n < 1) n = 1;
+    int fade_n = (int)((long long)rate * fd / 1000);
+    if (fade_n > n) fade_n = n;
+    short* pcm = (short*)malloc(sizeof(short) * (size_t)n);
+    if (!pcm) return XT_FROM_INT(0);
+    double w_c = 2.0 * 3.14159265358979323846 * f / (double)rate;
+    double w_m = w_c * r;
+    for (int i = 0; i < n; i++) {
+        double t = (double)i / (double)rate;
+        double car = sin(w_c * (double)i + idx * sin(w_m * (double)i));
+        double env = (dec > 0.0) ? exp(-t * 1000.0 / dec) : 1.0;
+        if (fade_n > 0 && i >= n - fade_n) env *= (double)(n - i) / (double)fade_n;
+        double s = car * env * v;
+        if (s > 1.0) s = 1.0;
+        if (s < -1.0) s = -1.0;
+        pcm[i] = (short)(s * 32767.0);
+    }
+    if (getenv("XT_WAVE_DUMP")) {                          // 与本库其余合成入口同一调试口
+        FILE* fdmp = fopen(getenv("XT_WAVE_DUMP"), "wb");
+        if (fdmp) { fwrite(pcm, sizeof(short), (size_t)n, fdmp); fclose(fdmp); }
+    }
+    Wave wv;
+    wv.frameCount = (unsigned int)n;
+    wv.sampleRate = (unsigned int)rate;
+    wv.sampleSize = 16;
+    wv.channels = 1;
+    wv.data = pcm;
+    Sound snd = LoadSoundFromWave(wv);
+    if (snd.stream.buffer == NULL || snd.frameCount == 0) {
+        free(pcm);
+        return XT_FROM_INT(0);
+    }
+    xt_snd_pool[slot] = snd;
+    xt_synth_pcm[slot] = pcm;                             // 保活;XT_UnloadSound 释放
+    xt_snd_used[slot] = 1;
+    return XT_FROM_INT(slot + 1);
+}
+
 uintptr_t XT_LoadMusicStream(uintptr_t filename) {
     int slot = xt_mus_alloc();
     if (slot < 0) return XT_FROM_INT(0);
